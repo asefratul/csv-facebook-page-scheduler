@@ -1,0 +1,6 @@
+post_type,post_content,post_comment,post_date,media_url
+text,"Good morning! Here is today's tip.",Read more: https://example.com,2030-01-01 09:00,
+link,"New article is live",,2030-01-01 12:00,https://example.com/blog/hello
+image,"A single picture with a caption",What do you think?,2030-01-02 09:00,media/photo.jpg
+images,"Several pictures in one post",,2030-01-02 18:00,media/one.jpg|media/two.jpg|media/three.jpg
+reel,"A short vertical video",Follow for more!,2030-01-03 18:00,media/clip.mp4

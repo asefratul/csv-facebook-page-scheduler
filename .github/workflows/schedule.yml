@@ -1,0 +1,70 @@
+name: Auto Post to Facebook
+
+on:
+  schedule:
+    # Every hour (at :07, because GitHub delays runs queued at the top of the hour).
+    # Each run publishes the rows in content.csv that are due and not yet in posted.csv.
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: parse and print the next post without publishing'
+        type: boolean
+        default: false
+      as_of:
+        description: "Optional: pretend 'now' is this time (YYYY-MM-DD HH:MM, or YYYY-MM-DD for the end of that day) to preview or catch up"
+        type: string
+        required: false
+
+# Needed so the job can push the updated posted.csv
+permissions:
+  contents: write
+
+# Never let two runs overlap (a manual run during the cron run could double-post)
+concurrency:
+  group: facebook-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    environment: production  # secrets live in the "production" environment
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run publishing script
+        env:
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          POST_AS_OF: ${{ inputs.as_of }}
+          # Optional repository variables (Settings > Secrets and variables > Actions > Variables)
+          POST_TIMEZONE: ${{ vars.POST_TIMEZONE }}
+          DEFAULT_POST_TIME: ${{ vars.DEFAULT_POST_TIME }}
+        run: python publish.py
+
+      # Runs even if the script exited non-zero (e.g. the post went live but the comment failed),
+      # so the published post is always recorded in posted.csv.
+      - name: Commit posted log
+        if: ${{ !cancelled() }}
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          if [ -f posted.csv ]; then git add posted.csv; fi
+          if git diff --cached --quiet; then
+            echo "posted.csv unchanged - nothing to commit"
+            exit 0
+          fi
+          git commit -m "Record published post"
+          git pull --rebase
+          git push
