@@ -23,6 +23,9 @@ content.csv  ──►  publish.py  ──►  Facebook Graph API  (post + optio
 | `publish.py` | Finds the rows that are due, publishes them, comments, logs them. |
 | `get_page_token.py` | One-off helper you run locally: turns a Graph API Explorer token into a verified non-expiring Page token. |
 | `.github/workflows/schedule.yml` | Runs `publish.py` hourly (and on demand) and commits `posted.csv`. |
+| `config.json`, `brand-guidelines.example.md` | Settings and a guidelines template for the optional AI draft workflow (see below). |
+| `make_content.py`, `generator/`, `sync_drafts.py`, `content-plan.csv`, `ideas/` | Optional: idea agent, draft generator and PR syncing (see *AI-assisted drafts*). |
+| `.github/workflows/*-ideas.yml`, `generate-content.yml`, `sync-drafts.yml` | Optional: the idea, draft and sync workflows. Delete them if you only want the plain scheduler. |
 
 ---
 
@@ -235,6 +238,130 @@ The run is marked **failed** (red, with a GitHub email) when:
 - a request **timed out**: the post may or may not have gone live. The row is logged as `UNCERTAIN` in `posted.csv` and is **not** retried, to avoid a double post. Check the Page; if it is not there, delete that line from `posted.csv` and the next run will try again.
 
 One bad row never blocks the others: the remaining due rows are still published in the same run.
+
+---
+
+## Optional: AI-assisted drafts, approved by merging a PR
+
+Everything above works on its own. This optional layer adds an agent that proposes post ideas, writes the posts
+for the ideas you approve, and opens them as pull requests. **You stay in control: nothing is posted unless you
+merge, and the publisher only ever reads `content.csv` on the default branch.**
+
+```
+weekly      Claude proposes ideas ──► GitHub issue (label content-ideas) + optional Telegram notice
+you         comment  /approve 1,3 hold 2 reject 4
+approved    ideas ──► content-plan.csv + ideas/<id>.json ──► draft workflow
+draft       Claude writes caption + card text, cards are rendered ──► pull request (label content-draft)
+you         review / edit in the web editor, then MERGE = approval      (close = reject)
+merged      publish.py posts it at its scheduled time; the next draft starts
+```
+
+### Setup (all of it is optional except the Anthropic key)
+
+1. **Secrets**, in the same `production` environment as the Facebook secrets (section 5 above):
+
+   | Name | Needed | Value |
+   |---|---|---|
+   | `ANTHROPIC_API_KEY` | for this whole feature | API key from [console.anthropic.com](https://console.anthropic.com) |
+   | `TELEGRAM_BOT_TOKEN` | optional | Token of a bot made with [@BotFather](https://t.me/BotFather) |
+   | `TELEGRAM_CHAT_ID` | optional | Your chat id with that bot (see below) |
+
+   Without the two Telegram secrets everything still works; you just get no phone notifications (and no reminder).
+   To find your chat id: message your bot once, add the two Telegram secrets (use `0` as a placeholder id), run
+   **Actions → Check Telegram → Run workflow**, read the id it lists, and put it in `TELEGRAM_CHAT_ID`.
+2. **Repository settings** (Settings → Actions → General → Workflow permissions): choose *Read and write
+   permissions* and tick *Allow GitHub Actions to create and approve pull requests*. Draft PRs are opened by the
+   workflow, so without this they fail.
+3. **Edit `config.json`**: brand name, language, link, disclaimer, hashtags, colours, cadence (table below).
+   Copy `brand-guidelines.example.md` to `brand-guidelines.md` and describe your voice, audience and rules. The AI
+   reads it for every idea and post. (If it is missing, the example is used.)
+4. **Variables**: set `POST_TIMEZONE` as described under *Time zone and default time*. The generator uses the
+   same variable, so draft dates and the publisher agree.
+5. Run **Actions → Propose post ideas → Run workflow** once to try it. The branch protection of the default branch
+   must allow the Actions bot to push (the approval workflow commits `content-plan.csv` and `ideas/` there).
+
+The repository must belong to a personal account: commands are accepted only from `github.repository_owner`
+(and `author_association == OWNER`). On an organisation repository no one would count as the owner; you would
+need to change that condition in the workflows deliberately.
+
+### `config.json`
+
+| Key | Meaning (default) |
+|---|---|
+| `brand_name` | Shown on the cards and given to the AI (`Your Brand`) |
+| `language` | Language the AI writes in (`English`). Any language works; also set `required_script` if you want a check |
+| `model` | Claude model id (`claude-sonnet-5-5`). Override per run with the `CLAUDE_MODEL` env variable |
+| `brand_guidelines` | Path of your guidelines file (`brand-guidelines.md`) |
+| `default_link` | Link added once to the first comment of each draft; empty = no link (empty) |
+| `disclaimer`, `hashtags` | Appended to every caption; empty = nothing added |
+| `required_script` | Optional regex every text must match, e.g. `[\u0600-\u06ff]` to require Arabic letters |
+| `blocked_patterns` | Extra regexes that block a draft or idea. A built-in list already blocks cure/diagnose/treat/guarantee/"100%" wording |
+| `kinds` | Post kinds the AI may propose and their labels (`tip`, `myth`, `activity`) |
+| `cadence` | `post_hour` (12), `spacing_days` (4 days after the last post), `lead_days` (3 days to review), `queue_below` (2: draft only when fewer future posts exist), `ideas_per_batch` (5), `max_pending` (4: stop proposing while this many approved topics wait) |
+| `card_style` | `background`, `accent`, `text`, `font_family`, `cover_subtitle`, `last_slide_note` for the cards |
+
+When the workflows run is set by the `cron:` lines in `.github/workflows/` (UTC): publisher hourly (`schedule.yml`),
+ideas on Sundays 04:00 (`propose-ideas.yml`), reminder 2 hours later (`remind-ideas.yml`), drafting daily 03:41
+(`generate-content.yml`). Edit them to change the cadence.
+
+### Approving ideas: `/approve`
+
+The weekly issue lists numbered ideas. Only **your** comment counts. The first line of the comment is the command:
+
+| Comment | Effect |
+|---|---|
+| `/approve 1,3` | Approve 1 and 3; the rest are rejected |
+| `/approve 1,3 hold 2` | Also hold 2: it returns first in the next batch (dropped after 3 holds) |
+| `/approve 1 hold 2,4 reject 3,5` | Explicit; **unlisted ideas are rejected** |
+| `/approve none` | Reject the whole batch |
+
+Lines after the first line are instructions for the drafts of the ideas approved in that comment, for example
+`Keep the language very simple`. Approved ideas go to `content-plan.csv` (status `pending`) and `ideas/<id>.json`;
+all decisions are logged in `ideas/log.csv`. If the issue is still open two hours after the weekly proposal, a
+Telegram reminder is sent (only if Telegram is set up).
+
+### Drafts: one open PR at a time, `/regenerate`
+
+After an approval, a merged draft, or the daily check, the draft workflow takes the next `pending` topic and opens
+a PR labelled `content-draft` that adds a row to `content.csv` plus its card images in `media/`. Only one draft is
+open at a time; a reminder is posted after 48 hours. **Merge before the first post date** or that post is skipped
+(only rows at most `CATCHUP_HOURS` overdue are published).
+
+Comment `/regenerate <feedback>` on the draft PR to replace it. Only you can. The old PR is closed and the topic is
+drafted again from the default branch. In the feedback you can ask for a first-post date and for wording changes;
+Claude reads it. Without an API key a line `date: 2026-11-20 09:30` still sets the date.
+
+`sync-drafts.yml` runs after each push to the default branch and merges it into open draft PR branches,
+resolving the append-only conflicts in `content.csv`. Anything else is left alone with a comment.
+
+### Safety
+
+- Commands are accepted only from the repository owner (`comment.user.login == repository_owner` and
+  `author_association == 'OWNER'`); comment and issue text is read only through environment variables, never
+  interpolated into shell scripts.
+- The ideas stored in the issue (a base64 payload) are re-validated on approval, as is every model reply: the
+  model can only return JSON through a single tool call; it has no tools and writes nothing itself.
+- Medical, legal and money-claim wording ("cure", "diagnose", "guarantee", "100%", plus your own patterns) blocks an
+  idea or draft; links are allowed only in the first comment, and the code adds the one link itself.
+- Telegram and API errors never include tokens or keys.
+- Rows are only appended to `content.csv` via a PR you merge, so a bad draft can be edited or closed.
+
+### Cards and video
+
+Drafts are `images` posts: a cover plus up to 3 text slides, rendered from a plain template
+(`generator/render.py`) with the colours in `card_style`. The cards are 1080x1080 PNGs made with Playwright; to
+test locally run `pip install -r requirements-generator.txt` and `python -m playwright install chromium`. To change the
+design, edit `card_pages` in `generator/render.py`. Reel generation is not included; you can still add `reel`
+rows by hand.
+
+### Commands
+
+```bash
+python make_content.py ideas              # propose ideas (writes ideas-issue.md; needs ANTHROPIC_API_KEY)
+python make_content.py next               # draft the next approved topic
+python make_content.py telegram-check     # diagnose Telegram
+python -m unittest discover -s tests -q   # run the tests
+```
 
 ---
 
