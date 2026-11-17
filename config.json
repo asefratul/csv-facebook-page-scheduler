@@ -1,0 +1,32 @@
+{
+  "brand_name": "Your Brand",
+  "language": "English",
+  "model": "claude-sonnet-5-5",
+  "brand_guidelines": "brand-guidelines.md",
+  "default_link": "https://example.com",
+  "disclaimer": "",
+  "hashtags": "",
+  "required_script": "",
+  "blocked_patterns": [],
+  "kinds": {
+    "tip": "Tips",
+    "myth": "Myth vs fact",
+    "activity": "Ideas to try"
+  },
+  "cadence": {
+    "post_hour": 12,
+    "spacing_days": 4,
+    "lead_days": 3,
+    "queue_below": 2,
+    "ideas_per_batch": 5,
+    "max_pending": 4
+  },
+  "card_style": {
+    "background": "#f8fafc",
+    "accent": "#2563eb",
+    "text": "#0f172a",
+    "font_family": "'Helvetica Neue', Arial, 'Noto Sans', sans-serif",
+    "cover_subtitle": "",
+    "last_slide_note": ""
+  }
+}
