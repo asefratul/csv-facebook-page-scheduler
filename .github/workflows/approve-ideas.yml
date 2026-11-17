@@ -1,0 +1,86 @@
+name: Approve post ideas
+
+# Comment `/approve 1,3 hold 2 reject 4` (unlisted = rejected; or `/approve none`) on an ideas issue created by propose-ideas.yml. Only the repository
+# owner's comment counts. Approved ideas are added to content-plan.csv (+ ideas/<id>.json), the rest of the batch
+# is logged as rejected (held ones return in the next batch), the issue is closed and drafting starts (generate-content.yml opens a draft PR).
+# This commits to the default branch, so branch protection must allow the Actions bot to push (it only touches
+# content-plan.csv and ideas/, never content.csv: nothing can be posted from here).
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  # Real commands queue with the content workflow (same group); every other comment gets a throwaway group.
+  group: ${{ (!github.event.issue.pull_request && startsWith(github.event.comment.body, '/approve') && github.event.comment.user.login == github.repository_owner) && 'content-draft' || format('ignored-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  approve:
+    if: >-
+      !github.event.issue.pull_request &&
+      github.event.issue.state == 'open' &&
+      github.event.issue.user.login == 'github-actions[bot]' &&
+      startsWith(github.event.comment.body, '/approve') &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.author_association == 'OWNER' &&
+      contains(github.event.issue.labels.*.name, 'content-ideas')
+    environment: production  # the Claude/Telegram secrets live in this environment (like schedule.yml)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install requests
+
+      - name: Apply the decision
+        id: apply
+        env:
+          POST_TIMEZONE: ${{ vars.POST_TIMEZONE }}
+          ISSUE: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # Comment and issue text are only read from env vars, never interpolated into the script.
+          printf '%s' "$ISSUE_BODY" > issue-body.txt
+          printf '%s' "$COMMENT_BODY" > comment.txt
+          set +e
+          python make_content.py approve --issue-body issue-body.txt --comment comment.txt --result approve-result.md
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then   # unusable command: explain and leave the issue open
+            gh issue comment "$ISSUE" --body-file approve-result.md
+          elif [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+            exit "$code"
+          fi
+
+      - name: Commit the plan and close the issue
+        if: steps.apply.outputs.code == '0' || steps.apply.outputs.code == '3'
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add content-plan.csv ideas
+          git commit -m "Ideas #$ISSUE: record approval decision"
+          git pull --rebase origin "$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)"
+          git push origin HEAD
+          gh issue comment "$ISSUE" --body-file approve-result.md
+          gh issue close "$ISSUE"
+
+      - name: Start drafting the approved ideas
+        if: steps.apply.outputs.code == '0'
+        run: gh workflow run generate-content.yml -f ignore_queue=true

@@ -1,0 +1,32 @@
+name: Keep draft PRs mergeable
+
+# After every push to the default branch (e.g. you merged a draft), bring the other open `content-draft` PRs up to date.
+# Their content.csv rows conflict with each other because each draft appends to the end of the file; this
+# merges the default branch in and keeps both sets of rows. Anything it cannot resolve is left alone and commented on.
+
+on:
+  push:
+    branches: [master, main]
+    paths: ['content.csv', 'content-plan.csv']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-drafts
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python sync_drafts.py

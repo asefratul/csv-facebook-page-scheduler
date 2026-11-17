@@ -1,0 +1,80 @@
+name: Propose post ideas
+
+# Weekly: Claude proposes post ideas, they are posted as a GitHub issue (label content-ideas) and announced on
+# Telegram. Comment `/approve 1,3` on the issue to approve (see approve-ideas.yml). Nothing is drafted or
+# posted from here. Needs the ANTHROPIC_API_KEY secret; TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are optional.
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'   # Sundays 04:00 UTC; change to suit your time zone (remind-ideas.yml runs 2 h later)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: content-ideas
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  ideas:
+    environment: production  # the Claude/Telegram secrets live in this environment (like schedule.yml)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip while the previous batch is still waiting
+        id: open
+        run: |
+          gh label create content-ideas --color 5319e7 --description "Post ideas awaiting approval" 2>/dev/null || true
+          n=$(gh issue list --label content-ideas --state open --json number --jq '.[0].number // empty')
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+          if [ -n "$n" ]; then echo "Ideas issue #$n is still open - not proposing more."; fi
+
+      - uses: actions/setup-python@v5
+        if: steps.open.outputs.number == ''
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        if: steps.open.outputs.number == ''
+        run: pip install requests
+
+      - name: Ask Claude for ideas
+        id: gen
+        if: steps.open.outputs.number == ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          POST_TIMEZONE: ${{ vars.POST_TIMEZONE }}
+        run: |
+          set +e
+          python make_content.py ideas
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then exit "$code"; fi
+
+      - name: Open the ideas issue and notify
+        if: steps.gen.outcome == 'success' && steps.gen.outputs.code == '0'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          url=$(gh issue create --label content-ideas --title "Post ideas for $(date -u +%Y-%m-%d)" --body-file ideas-issue.md)
+          echo "$url"
+          sed "s|{ISSUE_URL}|$url|" ideas-telegram.txt > telegram.txt
+          python make_content.py notify --text-file telegram.txt
+
+      - name: Tell me on Telegram if proposing failed
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "⚠️ Idea proposal failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > telegram.txt
+          python make_content.py notify --text-file telegram.txt || true

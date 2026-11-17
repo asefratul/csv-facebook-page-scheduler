@@ -1,0 +1,194 @@
+name: Draft next content
+
+# Takes the next pending topic from content-plan.csv (an idea you approved), has Claude write the copy,
+# renders the cards, schedules it in content.csv and opens a pull request. Merging the PR = approval; the hourly
+# publisher only ever reads what is on the default branch. Nothing is posted from here.
+#
+# Re-run from a PR: comment `/regenerate` (optionally followed by your feedback) on an open
+# `content-draft` PR. Only the repository owner can do this. It closes that PR and drafts the same
+# topic again from what is on the default branch (so push wording/design fixes there first). The
+# feedback is copied into the new PR as a note and also read by Claude (needs ANTHROPIC_API_KEY): a requested
+# first-post date is applied and wording requests are passed to the copywriter. Without the key, a line
+# `date: 2026-11-13 00:00` (in POST_TIMEZONE) still sets the date.
+
+on:
+  schedule:
+    - cron: '41 3 * * *'   # daily 03:41 UTC; drafts only when the queue of future posts is low
+  workflow_dispatch:
+    inputs:
+      ignore_queue:
+        description: 'Draft even if enough posts are already scheduled'
+        type: boolean
+        default: false
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [closed]   # a merged draft frees the one-open-PR slot: draft the next approved idea right away
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  # Only real /regenerate commands share the queue; any other comment gets a throwaway group.
+  group: ${{ (github.event_name != 'issue_comment' || (github.event.issue.pull_request && startsWith(github.event.comment.body, '/regenerate') && github.event.comment.user.login == github.repository_owner)) && 'content-draft' || format('ignored-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  draft:
+    # For comments: a PR, labelled content-draft, comment starts with /regenerate, written by the repo owner.
+    if: >-
+      (github.event_name != 'issue_comment' && github.event_name != 'pull_request') || (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        contains(github.event.pull_request.labels.*.name, 'content-draft')) || (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/regenerate') &&
+        github.event.comment.user.login == github.repository_owner &&
+        github.event.comment.author_association == 'OWNER' &&
+        contains(github.event.issue.labels.*.name, 'content-draft'))
+    environment: production  # the Claude/Telegram secrets live in this environment (like schedule.yml)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Handle /regenerate (close the old draft, keep the feedback)
+        if: github.event_name == 'issue_comment'
+        env:
+          PR: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # The comment is only ever read from an env var, never interpolated into the script.
+          state=$(gh pr view "$PR" --json state --jq .state)
+          if [ "$state" != "OPEN" ]; then echo "PR #$PR is $state - nothing to regenerate."; exit 1; fi
+          printf '%s' "$COMMENT_BODY" | sed '1s|^/regenerate||' | sed '/./,$!d' | head -c 2000 > feedback.txt
+          echo "$PR" > old-pr.txt
+          gh api -X POST "repos/${{ github.repository }}/issues/comments/$COMMENT_ID/reactions" -f content=eyes >/dev/null || true
+          gh pr close "$PR" --delete-branch --comment "Regenerating from the default branch (run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+
+      - name: Look for an open draft (one at a time) and remind if it is waiting
+        id: open
+        run: |
+          gh label create content-draft --color 0e8a16 --description "Generated post awaiting review" 2>/dev/null || true
+          old=0; [ -f old-pr.txt ] && old=$(cat old-pr.txt)   # a PR closed a moment ago can still be listed as open
+          n=$(gh pr list --label content-draft --state open --json number --jq "[.[] | select(.number != $old)][0].number // empty")
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+          if [ -n "$n" ]; then
+            created=$(gh pr view "$n" --json createdAt --jq .createdAt)
+            hours=$(( ( $(date +%s) - $(date -d "$created" +%s) ) / 3600 ))
+            echo "Draft PR #$n is open (${hours}h old) - not generating another one."
+            if [ "$hours" -ge 48 ] && ! gh pr view "$n" --json comments --jq '.comments[].body' | grep -q 'draft-reminder'; then
+              gh pr comment "$n" --body "<!-- draft-reminder -->@${{ github.repository_owner }} this draft has been waiting for review for over 2 days. Merge it to schedule the posts, or close it to reject. If it is not merged before its first post date, nothing is posted."
+            fi
+          fi
+
+      - name: Set up Python
+        if: steps.open.outputs.number == ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install renderer (Chrome)
+        if: steps.open.outputs.number == ''
+        timeout-minutes: 8
+        run: |
+          pip install -r requirements-generator.txt
+          if command -v google-chrome >/dev/null; then
+            echo "BROWSER_CHANNEL=chrome" >> "$GITHUB_ENV"   # the runner's preinstalled Chrome: no download
+          else
+            python -m playwright install --with-deps chromium
+          fi
+
+      - name: Run generator tests
+        if: steps.open.outputs.number == ''
+        run: python -m unittest discover -s tests -q
+
+      - name: Generate the draft
+        id: gen
+        if: steps.open.outputs.number == ''
+        env:
+          POST_TIMEZONE: ${{ vars.POST_TIMEZONE }}
+          CATCHUP_HOURS: ${{ vars.CATCHUP_HOURS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          IGNORE_QUEUE: ${{ inputs.ignore_queue || github.event_name == 'issue_comment' || github.event_name == 'pull_request' }}
+        run: |
+          branch="draft/content-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
+          args=(--branch "$branch" --summary draft-summary.md)
+          if [ "$IGNORE_QUEUE" != "true" ]; then args+=(--respect-queue); fi
+          if [ -s feedback.txt ]; then args+=(--feedback-file feedback.txt); fi
+          set +e
+          python make_content.py next "${args[@]}"
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          # 0 = drafted, 3 = queue is full enough, 4 = backlog empty; anything else is a real failure
+          if [ "$code" -ne 0 ] && [ "$code" -ne 3 ] && [ "$code" -ne 4 ]; then exit "$code"; fi
+
+      - name: Open an issue when the backlog is empty
+        if: steps.gen.outputs.code == '4'
+        run: |
+          gh label create content-backlog --color d93f0b --description "No pending topics left" 2>/dev/null || true
+          if [ -z "$(gh issue list --label content-backlog --state open --json number --jq '.[0].number // empty')" ]; then
+            gh issue create --label content-backlog --title "Content backlog is empty" \
+              --body "@${{ github.repository_owner }} there is no \`pending\` topic left in \`content-plan.csv\` and the posting queue is running low. Approve some ideas (see the weekly ideas issue) or add topics so drafting can continue."
+          fi
+
+      - name: Dry-run the new posts and open the pull request
+        # (a missing output compares equal to '0' in expressions, so require the step to have run)
+        if: steps.gen.outcome == 'success' && steps.gen.outputs.code == '0'
+        env:
+          BRANCH: ${{ steps.gen.outputs.branch }}
+          POST_TIMEZONE: ${{ vars.POST_TIMEZONE }}
+          DEFAULT_POST_TIME: ${{ vars.DEFAULT_POST_TIME }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          BASE=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
+          if [ -s feedback.txt ] && [ -n "$(tr -d '[:space:]' < feedback.txt)" ]; then
+            { echo; echo "### Your feedback on the previous draft (#$(cat old-pr.txt))"; echo; sed 's/^/> /' feedback.txt; echo; } >> draft-summary.md
+          fi
+          {
+            echo "<details><summary>Dry run of publish.py for each new post</summary>"
+            echo
+            echo '```text'
+            while read -r d; do
+              [ -z "$d" ] && continue
+              echo "=== as of $d"
+              POST_AS_OF="$(date -d "$d + 5 minutes" '+%Y-%m-%d %H:%M')" DRY_RUN=true python publish.py 2>&1 | head -40 || true
+            done < draft-summary.dates
+            echo '```'
+            echo "</details>"
+          } >> draft-summary.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add content.csv content-plan.csv media
+          title=$(head -1 draft-summary.md | sed 's/^## //')
+          git commit -m "$title"
+          git push origin "$BRANCH"
+          new=$(gh pr create --base "$BASE" --head "$BRANCH" --title "$title" \
+            --label content-draft --body-file draft-summary.md)
+          echo "$new"
+          if [ -f old-pr.txt ]; then gh pr comment "$(cat old-pr.txt)" --body "New draft: $new"; fi
+          { echo "📝 New draft ready for review"; echo; echo "$title"; echo "First post: $(head -1 draft-summary.dates) (${POST_TIMEZONE:-UTC})"
+            echo "Merge to approve, before the first post:"; echo "$new"; } > telegram.txt
+          python make_content.py notify --text-file telegram.txt --photo "$(cat draft-summary.photo 2>/dev/null)"
+
+      - name: Tell me on Telegram if drafting failed
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "⚠️ Content drafting failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > telegram.txt
+          python make_content.py notify --text-file telegram.txt || true
