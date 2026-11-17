@@ -25,7 +25,7 @@ content.csv  ──►  publish.py  ──►  Facebook Graph API  (post + optio
 | `.github/workflows/schedule.yml` | Runs `publish.py` hourly (and on demand) and commits `posted.csv`. |
 | `config.json`, `brand-guidelines.example.md` | Settings and a guidelines template for the optional AI draft workflow (see below). |
 | `make_content.py`, `generator/`, `sync_drafts.py`, `content-plan.csv`, `ideas/` | Optional: idea agent, draft generator and PR syncing (see *AI-assisted drafts*). |
-| `.github/workflows/*-ideas.yml`, `generate-content.yml`, `sync-drafts.yml` | Optional: the idea, draft and sync workflows. Delete them if you only want the plain scheduler. |
+| `optional-workflows/*.yml` | Optional, **inactive** idea, draft, reminder and sync workflows. Copy them to `.github/workflows/` in your own repo to use them (see the AI section). |
 
 ---
 
@@ -247,42 +247,61 @@ Everything above works on its own. This optional layer adds an agent that propos
 for the ideas you approve, and opens them as pull requests. **You stay in control: nothing is posted unless you
 merge, and the publisher only ever reads `content.csv` on the default branch.**
 
+> **These workflows are switched off in this repository.** They live in [`optional-workflows/`](optional-workflows/),
+> which GitHub ignores, so cloning or forking this repo never runs them or needs the extra secrets. Only
+> `.github/workflows/schedule.yml` (the plain publisher) is active. To use the AI layer, follow the
+> prerequisites below in **your own repository** and copy the files over.
+
+### How it fits together
+
+```mermaid
+flowchart TD
+    subgraph WEEKLY["Weekly (propose-ideas.yml)"]
+        A[Claude proposes ideas<br/>uses config.json + brand guidelines] --> B[GitHub issue<br/>label: content-ideas]
+        B -.optional.-> T1[Telegram notice]
+        B -.2 h later, if still open.-> T2[Telegram reminder<br/>remind-ideas.yml]
+    end
+    B --> C{{"You comment<br/>/approve 1,3 hold 2 reject 4"}}
+    C -->|approve-ideas.yml| D[content-plan.csv<br/>+ ideas/ID.json<br/>status: pending]
+    D --> E["generate-content.yml<br/>Claude writes caption + card text,<br/>cards rendered to media/"]
+    E --> F[Pull request<br/>label: content-draft<br/>one open at a time]
+    F --> G{{"You review"}}
+    G -->|"/regenerate feedback"| E
+    G -->|close| X[Rejected]
+    G -->|"MERGE = approval"| H[content.csv on default branch]
+    H --> I["schedule.yml / publish.py<br/>posts to Facebook at the scheduled time"]
+    I --> J[posted.csv]
+    G -.merged: next draft starts.-> E
+    K[sync-drafts.yml<br/>keeps open draft PRs up to date] -.-> F
 ```
-weekly      Claude proposes ideas ──► GitHub issue (label content-ideas) + optional Telegram notice
-you         comment  /approve 1,3 hold 2 reject 4
-approved    ideas ──► content-plan.csv + ideas/<id>.json ──► draft workflow
-draft       Claude writes caption + card text, cards are rendered ──► pull request (label content-draft)
-you         review / edit in the web editor, then MERGE = approval      (close = reject)
-merged      publish.py posts it at its scheduled time; the next draft starts
-```
 
-### Setup (all of it is optional except the Anthropic key)
+### Prerequisites (before copying the workflows)
 
-1. **Secrets**, in the same `production` environment as the Facebook secrets (section 5 above):
+You need all of these. Without them the workflows fail or do nothing.
 
-   | Name | Needed | Value |
-   |---|---|---|
-   | `ANTHROPIC_API_KEY` | for this whole feature | API key from [console.anthropic.com](https://console.anthropic.com) |
-   | `TELEGRAM_BOT_TOKEN` | optional | Token of a bot made with [@BotFather](https://t.me/BotFather) |
-   | `TELEGRAM_CHAT_ID` | optional | Your chat id with that bot (see below) |
+| # | Prerequisite | Why |
+|---|---|---|
+| 1 | The plain publisher already works (sections 1-5 above: Page, Meta app, Page token, Facebook secrets) | Merged drafts are published by `publish.py`; this layer only writes to `content.csv` |
+| 2 | A repository under a **personal GitHub account** | Commands are accepted only from `github.repository_owner`; on an organisation repo nobody counts as owner |
+| 3 | A **GitHub environment named `production`** holding the secrets below | The workflows declare `environment: production` |
+| 4 | Secret `ANTHROPIC_API_KEY` (from [console.anthropic.com](https://console.anthropic.com), has a cost per run) | Idea and draft writing |
+| 5 | Optional secrets `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` | Phone notices and the reminder; everything works without them |
+| 6 | Settings → Actions → General → Workflow permissions: **Read and write**, and tick **Allow GitHub Actions to create and approve pull requests** | The workflows open draft PRs and commit the plan |
+| 7 | Default branch protection that lets the Actions bot push (or a ruleset bypass for it) | The approval workflow commits `content-plan.csv` and `ideas/` |
+| 8 | Repository variable `POST_TIMEZONE` (see *Time zone and default time*) | Draft dates and the publisher must agree |
+| 9 | `config.json` edited and `brand-guidelines.md` written (copy `brand-guidelines.example.md`) | Brand name, language, link, disclaimer, hashtags, cadence |
 
-   Without the two Telegram secrets everything still works; you just get no phone notifications (and no reminder).
-   To find your chat id: message your bot once, add the two Telegram secrets (use `0` as a placeholder id), run
-   **Actions → Check Telegram → Run workflow**, read the id it lists, and put it in `TELEGRAM_CHAT_ID`.
-2. **Repository settings** (Settings → Actions → General → Workflow permissions): choose *Read and write
-   permissions* and tick *Allow GitHub Actions to create and approve pull requests*. Draft PRs are opened by the
-   workflow, so without this they fail.
-3. **Edit `config.json`**: brand name, language, link, disclaimer, hashtags, colours, cadence (table below).
-   Copy `brand-guidelines.example.md` to `brand-guidelines.md` and describe your voice, audience and rules. The AI
-   reads it for every idea and post. (If it is missing, the example is used.)
-4. **Variables**: set `POST_TIMEZONE` as described under *Time zone and default time*. The generator uses the
-   same variable, so draft dates and the publisher agree.
-5. Run **Actions → Propose post ideas → Run workflow** once to try it. The branch protection of the default branch
-   must allow the Actions bot to push (the approval workflow commits `content-plan.csv` and `ideas/` there).
+### Enabling it in your own repository
 
-The repository must belong to a personal account: commands are accepted only from `github.repository_owner`
-(and `author_association == OWNER`). On an organisation repository no one would count as the owner; you would
-need to change that condition in the workflows deliberately.
+1. Copy the workflow files you want from `optional-workflows/` into `.github/workflows/` of your repo
+   (`approve-ideas`, `generate-content`, `propose-ideas`, `sync-drafts` are the core; `remind-ideas` and
+   `telegram-check` are only useful with Telegram).
+2. Complete the prerequisites above. To find your Telegram chat id: message your bot once, add the two Telegram
+   secrets (use `0` as a placeholder id), run **Actions -> Check Telegram -> Run workflow**, read the id it lists
+   and put it in `TELEGRAM_CHAT_ID`.
+3. Run **Actions -> Propose post ideas -> Run workflow** once to try it.
+
+Deleting `optional-workflows/` and the generator files leaves the plain scheduler untouched.
 
 ### `config.json`
 
@@ -300,7 +319,7 @@ need to change that condition in the workflows deliberately.
 | `cadence` | `post_hour` (12), `spacing_days` (4 days after the last post), `lead_days` (3 days to review), `queue_below` (2: draft only when fewer future posts exist), `ideas_per_batch` (5), `max_pending` (4: stop proposing while this many approved topics wait) |
 | `card_style` | `background`, `accent`, `text`, `font_family`, `cover_subtitle`, `last_slide_note` for the cards |
 
-When the workflows run is set by the `cron:` lines in `.github/workflows/` (UTC): publisher hourly (`schedule.yml`),
+When the workflows run is set by the `cron:` lines in the workflow files (UTC): publisher hourly (`schedule.yml`),
 ideas on Sundays 04:00 (`propose-ideas.yml`), reminder 2 hours later (`remind-ideas.yml`), drafting daily 03:41
 (`generate-content.yml`). Edit them to change the cadence.
 

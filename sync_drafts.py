@@ -6,7 +6,7 @@ content.csv and they conflict as soon as a sibling lands. This merges the defaul
 the only conflict is content.csv, resolves it by taking the default branch's file and appending the rows that branch added.
 Anything else is left alone: the merge is aborted and a comment says so (once).
 
-Run by .github/workflows/sync-drafts.yml after every push to the default branch; needs git and the gh CLI."""
+Run by optional-workflows/sync-drafts.yml (copied to .github/workflows/) after every push to the default branch; needs git and the gh CLI."""
 import os
 import subprocess
 import sys
